@@ -5,6 +5,7 @@ import random
 import pickle
 import argparse
 import logging
+import numpy as np
 
 from collections import defaultdict
 from transformers import GPT2Tokenizer
@@ -132,18 +133,84 @@ class PromptCorpus:
             "test_index": self.test_data[item]["index"],
             "input_sequences_prompt": torch.stack(input_sequences_prompt, dim=0)
         }
+    
+# Updated Evaluate Prompt Variations Function with Accuracy Calculation
+from scipy.stats import pearsonr, spearmanr
+def aggregate_results(final_result, num_subsets=256, topk=4):
+    acc = [i/num_subsets for i in final_result[1]][:24]
+    entropys = [i for i in final_result[0]][:24]
+
+    # Convert accuracy list to percentages
+    acc_mean = np.mean(acc)
+    acc_std = np.std(acc)
+
+    # Calculate correlations between entropys and acc
+    pearsonr_metric, spearmanr_metric = pearsonr(entropys, acc), spearmanr(entropys, acc)
+    print("Pearson Correlation:", pearsonr_metric, "Spearman Correlation:", spearmanr_metric)
+
+    # Sort by entropy and select top-k prompts
+    gg = list(zip(entropys, acc))
+    gg.sort(key=lambda x: x[0], reverse=True)
+    if len(gg) == 2:
+        print(f"1-shot case, only two examples, change topk from {topk} to 1")
+        topk = 1
+    assert len(gg) > topk, f"Total permutations are less than {topk}"
+    subset_acc = [elem[1] for elem in gg[:topk]]
+    
+    # Statistics for top-k subset
+    subset_acc_mean = np.mean(subset_acc)
+    subset_acc_std = np.std(subset_acc)
+    print(f"Before: mean accuracy {acc_mean}, std {acc_std}")
+    print(f"After: mean accuracy {subset_acc_mean}, std {subset_acc_std}")
+
+    result = {
+        "acc_stats": (acc_mean, acc_std),
+        "topk_acc_stats": (subset_acc_mean, subset_acc_std),
+        "topk": topk,
+        "entropys": entropys,
+        "acc": acc,
+        "pearsonr_corr": pearsonr_metric,
+        "spearmanr_corr": spearmanr_metric,
+    }
+    return result
+
+def append_results(final_result, result_i):
+    # result_i = sorted(result_i, key=lambda x: x[0])
+    sorted_result = sorted(zip(result_i[0], result_i[1]), key=lambda x: x[0])
+    entropy, acc = zip(*sorted_result)
+    entropy, acc = list(entropy), list(acc)   
+    for i, prompt in enumerate(result_i[0]):
+        if final_result[0]:
+            final_result[0][i] += entropy[i] # Stores entropy for each prompt
+            final_result[1][i] += acc[i] # Stores accuracy for each prompt
+        else:
+            final_result = [entropy, acc]
+            break
+    return final_result
+
 
 if __name__ == "__main__":
     import yaml
     import easydict
     dataset = 'sst2'
 
-    # corpus_config = yaml.safe_load(open("config/rte.yaml"))
-    corpus_config = yaml.safe_load(open(f"/Users/danielvennemeyer/Workspace/NLP/ordered-prompt/config/{dataset}.yaml"))
+    corpus_config = yaml.safe_load(open(f"config/{dataset}.yaml"))
+    # corpus_config = yaml.safe_load(open(f"/Users/danielvennemeyer/Workspace/NLP/ordered-prompt/config/{dataset}.yaml"))
     cfg = easydict.EasyDict(corpus_config)
-    rte = PromptCorpus(**cfg)
-    datapoint = rte[0]
-    prompts = [datapoint['raw_sequence'] for datapoint in rte]
-    roberta.run_prompt_variations(prompts, dataset_name=dataset)
+    final_results = [[],[]]
+    num_subsets = 256
+
+    roberta_model = roberta.Roberta(dataset)
+    for i in range(num_subsets):
+        rte = PromptCorpus(**cfg)
+        datapoint = rte[0]
+        prompts = [(datapoint['raw_sequence'], datapoint['label']) for datapoint in rte]
+        result_i = roberta_model.run_prompt_variations(prompts)
+        final_results = append_results(final_results, result_i)
+        print(f"Permutation set {i}: {result_i[0][:24]}")
+
+    final_results = aggregate_results(final_results, num_subsets=num_subsets)
+    with open(f"evaluation_results/{dataset}_results.json", "w") as entropy_log:
+        json.dump(final_results, entropy_log)
 
 
